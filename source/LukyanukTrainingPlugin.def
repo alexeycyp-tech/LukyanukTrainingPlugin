@@ -1,0 +1,3 @@
+LIBRARY LukyanukTrainingPlugin
+EXPORTS
+    RBR_CreatePlugin

@@ -1,0 +1,12 @@
+LukyanukTrainingPlugin 0.5.11 validation
+
+Build: successful with Zig 0.13.0, x86 Windows target.
+Static PE check: PE32 x86.
+Plugin DLL size: 298496 bytes.
+Plugin DLL SHA-256: 89B421648A4DC72938A680B20FB110F62A361D9824BD46B54324C307FC5498F6
+Engine RPM capture/write: removed from this candidate.
+Ignition bridge: internal RBRControls action, gated by the exact analyzed SHA-256 and a code signature check.
+Analyzed RBRControls.dll SHA-256: ac6c1858c4a7abf22fa30df0d9e943c37b3e68caa7b1a86ce8c09547a78918dc
+Runtime status: not tested in RBR. A routed call does not prove the request was processed or the engine started.
+The inferred 1/0 press/release meaning remains unverified in-game.
+Original game files and RBRControls.dll were not modified.

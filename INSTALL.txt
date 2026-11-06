@@ -1,0 +1,17 @@
+LukyanukTraining 0.5.11 - Installation and Test
+
+INSTALL
+1. Close Richard Burns Rally.
+2. Back up your current Plugins\LukyanukTrainingPlugin.dll and Plugins\LukyanukTrainingPlugin\LukyanukTrainingPlugin.ini.
+3. Extract this archive into the RBR game folder (the folder containing RichardBurnsRally.exe). Keep the Plugins folder structure.
+4. Replace the plugin DLL if Windows asks. Keep your existing INI to preserve your key bindings.
+5. Do not replace RBRControls.dll.
+
+ENGINE START TEST
+1. Start a stage and save a point with your Save Position button (Enter by default).
+2. Stop the engine, then press your Restart button (Space by default).
+3. During the frozen countdown, the plugin temporarily enables Clutch Help and tries to send a brief Ignition action through RBRControls.
+4. Check whether the engine starts. A log entry shows an internal call attempt, not whether RBR processed it or started the engine.
+
+The Ignition test runs only when RBRControls.dll matches the analyzed file. Otherwise, it is skipped. Engine RPM capture and restore are not included.
+Logs: Plugins\LukyanukTrainingPlugin\logs

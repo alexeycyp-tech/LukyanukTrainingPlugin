@@ -1,0 +1,6 @@
+/build/
+/Plugins/
+/Symbols/
+*.log
+*.pdb
+*.lib
