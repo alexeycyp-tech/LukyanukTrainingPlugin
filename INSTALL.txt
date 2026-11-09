@@ -1,17 +1,16 @@
-LukyanukTraining 0.5.11 - Installation and Test
+LukyanukTrainingPlugin 1.0 - Installation
 
-INSTALL
 1. Close Richard Burns Rally.
-2. Back up your current Plugins\LukyanukTrainingPlugin.dll and Plugins\LukyanukTrainingPlugin\LukyanukTrainingPlugin.ini.
-3. Extract this archive into the RBR game folder (the folder containing RichardBurnsRally.exe). Keep the Plugins folder structure.
-4. Replace the plugin DLL if Windows asks. Keep your existing INI to preserve your key bindings.
-5. Do not replace RBRControls.dll.
+2. Back up Plugins\LukyanukTrainingPlugin.dll.
+3. Extract this archive into the RBR game folder (the folder containing RichardBurnsRally.exe), keeping the Plugins folder structure.
+4. Replace the plugin DLL. Keep your existing Plugins\LukyanukTrainingPlugin\LukyanukTrainingPlugin.ini so your button assignments are preserved.
+5. Start a stage and use the plugin menu to check or assign Save, Restart, and Jump Back buttons.
 
-ENGINE START TEST
-1. Start a stage and save a point with your Save Position button (Enter by default).
-2. Stop the engine, then press your Restart button (Space by default).
-3. During the frozen countdown, the plugin temporarily enables Clutch Help and tries to send a brief Ignition action through RBRControls.
-4. Check whether the engine starts. A log entry shows an internal call attempt, not whether RBR processed it or started the engine.
+QUICK USE
 
-The Ignition test runs only when RBRControls.dll matches the analyzed file. Otherwise, it is skipped. Engine RPM capture and restore are not included.
+- Press Enter (default Save button) to save a restart position and begin a new timing session. The stopwatch appears immediately; the timed section starts when the car crosses the line 5 m past the saved position.
+- Press Space (default Restart button) at the desired finish point. The first timed pass is recorded as the reference if at least two valid samples were collected, then the car returns to the saved position.
+- Press Space again to repeat the section and compare the result with the best time.
+- Press the assigned Jump Back button to return to the nearest checkpoint behind the car.
+
 Logs: Plugins\LukyanukTrainingPlugin\logs

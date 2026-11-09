@@ -1,4 +1,4 @@
-/* LukyanukTrainingPlugin 0.5.11-rbrcontrols-ignition-test. No RPM code; hash-gated RBRControls ignition test.
+/* LukyanukTrainingPlugin 0.5.17-jumpback-point-reset-test. No RPM write code.
  * Native x86 test plugin, no PaceNote dependency.
  * ABI declarations are written in C deliberately: GNU C++ virtual destructors
  * have a different layout from RBR's MSVC IPlugin ABI.
@@ -22,10 +22,11 @@
 #include "pose_layout.h"
 #include "ngp_pose_layout.h"
 #define TC __attribute__((thiscall))
-#define VERSION "0.5.11-rbrcontrols-ignition-test"
-#define DISPLAY_VERSION "0.5.11"
+#define VERSION "1.0"
+#define DISPLAY_VERSION "1.0"
 #define DIAGNOSTIC_DISABLE_GAMEPLAY_OVERLAYS 0
 #define RESUME_DELAY_SECONDS 3
+#define FRAME_TICK_INTERVAL_MS 33u
 #define POSITION_SAVED_DISPLAY_MS 3000
 #define RESULTS_DISPLAY_DEFAULT_SECONDS 5
 #define RESULTS_DISPLAY_MIN_SECONDS 1
@@ -37,16 +38,17 @@
 #define EXE_HASH "5bb1b0c8f6719faecad63b0aafd7541089d1d1ff7a4c9bb68ed49bb53dc6f63b"
 #define NGP_HASH "cf351cdf99f880631ed2cb1d9b6b5c9db7d7c233ad905740393c37df967801ec"
 typedef struct { void **v; } Object;
-typedef HRESULT (WINAPI *EndSceneFn)(IDirect3DDevice9 *);
+typedef HRESULT (WINAPI *PresentFn)(IDirect3DDevice9 *,const RECT *,const RECT *,HWND,const RGNDATA *);
 static HMODULE self_module;
 static Object plugin, *game;
 static HANDLE log_file=INVALID_HANDLE_VALUE;
 static wchar_t folder[1024], ini_path[1024];
 static UINT_PTR timer_id;
 static void **hook_slot;
-static EndSceneFn previous_end;
+static PresentFn previous_present;
 static volatile LONG busy, log_busy, inside_load, disabled;
 static DWORD factory_thread, render_thread, last_heartbeat, stopped_since, verification_at;
+static DWORD last_frame_tick, joy_refresh_at;
 static DWORD last_config, message_until;
 static LONG sequence;
 static unsigned generation;
@@ -84,8 +86,6 @@ static DWORD seq_release_at, seq_check_at;
 static int countdown_active, countdown_last=-1;
 static int overlay_reported_second=-1;
 static DWORD countdown_started_at, countdown_released_at;
-static int rbr_ignition_hold_active, rbr_ignition_bridge_checked, rbr_ignition_bridge_available;
-static DWORD rbr_ignition_release_at;
 static int pending_fresh_session,pending_fresh_sample_valid;
 static Sample pending_fresh_sample;
 static Sample freeze_pose, freeze_last;
@@ -101,6 +101,8 @@ static unsigned first_observed_ms, motion_bucket;
 static char message[192]="LukyanukTrainingPlugin: initializing";
 static DWORD render_heartbeat_at;
 static unsigned render_heartbeat_frames;
+static int render_scene_failure_reported;
+#define D3D9_PRESENT_SLOT 17u
 #if DIAGNOSTIC_DISABLE_GAMEPLAY_OVERLAYS
 static int render_diagnostic_reported;
 #endif
@@ -135,6 +137,17 @@ static unsigned jump_back_pending_point;
 static float jump_back_pending_distance,jump_back_pending_index;
 static Sample jump_back_before;
 static DWORD jump_back_started_at,jump_back_last_success_at;
+static unsigned jump_back_queued;
+static unsigned jump_back_queue_head;
+static DWORD jump_back_queued_press_at[JUMP_BACK_MAX_POINTS];
+static int jump_back_queue_ready;
+static DWORD jump_back_pending_press_at;
+static unsigned jump_back_notice_steps;
+static float jump_back_notice_position;
+static DWORD jump_back_notice_last_success_press_at,jump_back_notice_until;
+static int jump_back_overlay_reported;
+#define JUMP_BACK_NOTICE_WINDOW_MS 2000u
+#define JUMP_BACK_NOTICE_DISPLAY_MS 2000u
 #define DAMAGE_BUFFER_SIZE 0x3EB0u
 static uintptr_t saved_damage_address;
 static char saved_damage_hash[65];
@@ -150,9 +163,9 @@ static void log_event(const char *event,const char *fmt,...) {
         t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,
         InterlockedIncrement(&sequence),(unsigned long)GetTickCount(),(unsigned long)GetCurrentThreadId(),event,detail);
     if(n>0) { DWORD written; if(!WriteFile(log_file,line,(DWORD)strlen(line),&written,0) || written!=strlen(line)) InterlockedExchange(&disabled,1); }
-    /* Keep the 30 Hz render-thread sample stream buffered. Control events
-     * still flush immediately so Save/Load diagnostics survive. */
-    if(strcmp(event,"SAMPLE") && strcmp(event,"TIMER_SAMPLE")) FlushFileBuffers(log_file);
+    /* Avoid synchronous disk flushes in the render callback. The log is
+     * flushed by non-render callers and explicitly during shutdown. */
+    if(GetCurrentThreadId()!=render_thread && strcmp(event,"SAMPLE") && strcmp(event,"TIMER_SAMPLE")) FlushFileBuffers(log_file);
     InterlockedExchange(&log_busy,0);
 }
 static void notify(const char *text) {
@@ -164,7 +177,6 @@ static const IID iid_direct_input8a={0xBF798030,0x483A,0x4DA2,{0xAA,0x99,0x5D,0x
 static const GUID guid_button_object={0xA36D02F0,0xC9F3,0x11CF,{0xBF,0xC7,0x44,0x45,0x53,0x54,0x00,0x00}};
 static DIOBJECTDATAFORMAT joy_object_format[JOY_BUTTON_COUNT];
 static DIDATAFORMAT joy_data_format;
-static DWORD joy_refresh_at;
 static void make_joy_data_format(unsigned button_count) {
     if(button_count>JOY_BUTTON_COUNT) button_count=JOY_BUTTON_COUNT;
     for(unsigned i=0;i<button_count;i++) {
@@ -243,7 +255,7 @@ static void ensure_controller_input(void) {
         HRESULT hr=create((HINSTANCE)GetModuleHandleW(0),DIRECTINPUT_VERSION,&iid_direct_input8a,(void**)&direct_input,0);
         if(FAILED(hr) || !direct_input) { if(!joy_reported) log_event("CONTROLLER_INPUT_UNAVAILABLE","stage=create_interface hr=%08lx",(unsigned long)hr); joy_reported=1; direct_input=0; return; }
         joy_reported=0;
-        log_event("CONTROLLER_INPUT_READY","backend=DirectInput8 enumeration=game_controllers exclusive=0");
+        log_event("CONTROLLER_INPUT_READY","backend=plugin_owned_DirectInput8 enumeration=game_controllers exclusive=0 poll_hz=30");
     }
     if(!joy_device_count && (DWORD)(GetTickCount()-joy_refresh_at)>=1000) {
         joy_refresh_at=GetTickCount();
@@ -264,8 +276,7 @@ static void poll_controllers(void) {
             if(entry->have_sample) {
                 entry->previous=entry->state;
                 for(unsigned b=0;b<JOY_BUTTON_COUNT;b++) if((sample.rgbButtons[b]&0x80) && !(entry->previous.rgbButtons[b]&0x80)) entry->button_edges[b]=1;
-            }
-            else { entry->previous=sample; entry->have_sample=1; }
+            } else { entry->previous=sample; entry->have_sample=1; }
             entry->state=sample; entry->ready=1;
         } else {
             entry->previous=entry->state; memset(&entry->state,0,sizeof(entry->state));
@@ -277,12 +288,6 @@ static int controller_button_down(const GUID *guid,int button) {
     if(button<0 || button>=JOY_BUTTON_COUNT) return 0;
     for(unsigned i=0;i<joy_device_count;i++) if(joy_devices[i].ready && guid_equal(&joy_devices[i].guid,guid))
         return (unsigned)button<joy_devices[i].button_count && (joy_devices[i].state.rgbButtons[button]&0x80)!=0;
-    return 0;
-}
-static int controller_button_edge(const GUID *guid,int button) {
-    if(button<0 || button>=JOY_BUTTON_COUNT) return 0;
-    for(unsigned i=0;i<joy_device_count;i++) if(joy_devices[i].ready && guid_equal(&joy_devices[i].guid,guid))
-        return (unsigned)button<joy_devices[i].button_count && (joy_devices[i].state.rgbButtons[button]&0x80)!=0 && (joy_devices[i].previous.rgbButtons[button]&0x80)==0;
     return 0;
 }
 static int any_controller_button_down(void) {
@@ -298,6 +303,9 @@ static int capture_controller_button(GUID *guid,int *button) {
             return 1;
         }
     return 0;
+}
+static void clear_controller_edges(void) {
+    for(unsigned i=0;i<joy_device_count;i++) memset(joy_devices[i].button_edges,0,sizeof(joy_devices[i].button_edges));
 }
 static int countdown_seconds_remaining(DWORD elapsed_ms) {
     DWORD duration=(DWORD)RESUME_DELAY_SECONDS*1000;
@@ -654,6 +662,87 @@ static void draw_timer_overlay(IDirect3DDevice9 *device) {
         timer_overlay_reported=mode;
     }
 }
+static void draw_jump_back_overlay(IDirect3DDevice9 *device) {
+    DWORD now=GetTickCount();
+    if(!jump_back_notice_until) return;
+    if((LONG)(jump_back_notice_until-now)<=0) {
+        log_event("JUMP_BACK_OVERLAY_EXPIRED","steps=%u position=%.3f",jump_back_notice_steps,jump_back_notice_position);
+        jump_back_notice_until=0; jump_back_overlay_reported=0;
+        return;
+    }
+    if(run_context_suspended || countdown_active) return;
+    char label[16],distance_text[32],subline[64];
+    unsigned nominal_m=jump_back_notice_steps*(unsigned)JUMP_BACK_SPACING_METERS;
+    snprintf(label,sizeof(label),"JUMP BACK");
+    snprintf(distance_text,sizeof(distance_text),"%u METERS",nominal_m);
+    snprintf(subline,sizeof(subline),"CURRENT POSITION %.0f M",jump_back_notice_position);
+    D3DVIEWPORT9 viewport; memset(&viewport,0,sizeof(viewport));
+    HRESULT hr=IDirect3DDevice9_GetViewport(device,&viewport);
+    if(FAILED(hr) || viewport.Width<160 || viewport.Height<120) {
+        if(jump_back_overlay_reported!=2) {
+            log_event("JUMP_BACK_OVERLAY_FAILED","stage=viewport hr=%08lx width=%lu height=%lu",(unsigned long)hr,(unsigned long)viewport.Width,(unsigned long)viewport.Height);
+            jump_back_overlay_reported=2;
+        }
+        return;
+    }
+    float distance_height=fmaxf(21.0f,fminf((float)viewport.Height*0.10f,96.0f));
+    float label_height=distance_height*0.78f;
+    float subline_height=distance_height*0.58f;
+    float headline_gap=distance_height*0.12f;
+    float label_width=(float)strlen(label)*label_height/7.0f*6.0f;
+    float distance_width=(float)strlen(distance_text)*distance_height/7.0f*6.0f;
+    float headline_width=label_width+headline_gap+distance_width;
+    float subline_width=(float)strlen(subline)*subline_height/7.0f*6.0f;
+    float width_limit=(float)viewport.Width*0.88f;
+    float widest=fmaxf(headline_width,subline_width);
+    if(widest>width_limit) {
+        float scale=width_limit/widest;
+        distance_height*=scale; label_height*=scale; subline_height*=scale;
+        headline_gap*=scale; label_width*=scale; distance_width*=scale;
+        headline_width*=scale; subline_width*=scale;
+    }
+    if(distance_height<7.0f || label_height<7.0f || subline_height<7.0f) return;
+    float gap=fmaxf(4.0f,distance_height*0.12f);
+    float group_height=distance_height+gap+subline_height;
+    float headline_left=(float)viewport.X+((float)viewport.Width-headline_width)*0.5f;
+    float subline_left=(float)viewport.X+((float)viewport.Width-subline_width)*0.5f;
+    float top=(float)viewport.Y+((float)viewport.Height-group_height)*0.5f;
+
+    IDirect3DStateBlock9 *state=0;
+    hr=IDirect3DDevice9_CreateStateBlock(device,D3DSBT_ALL,&state);
+    if(SUCCEEDED(hr) && state) hr=IDirect3DStateBlock9_Capture(state);
+    else if(SUCCEEDED(hr)) hr=E_FAIL;
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetVertexShader(device,0);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetPixelShader(device,0);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetTexture(device,0,0);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetFVF(device,D3DFVF_XYZRHW|D3DFVF_DIFFUSE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_ZENABLE,FALSE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_LIGHTING,FALSE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_CULLMODE,D3DCULL_NONE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_ALPHATESTENABLE,FALSE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_ALPHABLENDENABLE,TRUE);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
+    if(SUCCEEDED(hr)) hr=IDirect3DDevice9_SetRenderState(device,D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+    if(SUCCEEDED(hr)) overlay_batch_begin(device);
+    DWORD yellow=D3DCOLOR_ARGB(255,255,218,76);
+    if(SUCCEEDED(hr)) hr=draw_pixel_text(device,label,headline_left,top+(distance_height-label_height)*0.5f,label_height,yellow);
+    if(SUCCEEDED(hr)) hr=draw_pixel_text(device,distance_text,headline_left+label_width+headline_gap,top,distance_height,yellow);
+    if(SUCCEEDED(hr)) hr=draw_pixel_text(device,subline,subline_left,top+distance_height+gap,subline_height,yellow);
+    if(SUCCEEDED(hr)) hr=overlay_batch_flush(device); else overlay_batch_cancel();
+    HRESULT restore=state?IDirect3DStateBlock9_Apply(state):E_FAIL;
+    if(state) IDirect3DStateBlock9_Release(state);
+    if(SUCCEEDED(hr) && SUCCEEDED(restore)) {
+        if(jump_back_overlay_reported!=1) {
+            log_event("JUMP_BACK_OVERLAY_DRAWN","steps=%u nominal_m=%u current_position_m=%.3f label_scale=0.78 distance_scale=1.00 method=d3d9_outlined_5x7_centered state_restored=1",
+                jump_back_notice_steps,nominal_m,jump_back_notice_position);
+            jump_back_overlay_reported=1;
+        }
+    } else if(jump_back_overlay_reported!=2) {
+        log_event("JUMP_BACK_OVERLAY_FAILED","stage=draw_or_restore hr=%08lx restore_hr=%08lx state_restored=%d",
+            (unsigned long)hr,(unsigned long)restore,state?1:0);
+        jump_back_overlay_reported=2;
+    }
+}
 static void transform_row_point(const D3DMATRIX *matrix,const float in[4],float out[4]) {
     for(unsigned col=0;col<4;col++) out[col]=in[0]*matrix->m[0][col]+in[1]*matrix->m[1][col]+in[2]*matrix->m[2][col]+in[3]*matrix->m[3][col];
 }
@@ -962,68 +1051,7 @@ static int hash_module(HMODULE module,const char *expected,const char *name) {
     int ok=GetModuleFileNameW(module,path,1024) && file_hash(path,hash) && !strcmp(hash,expected);
     log_event("BINARY_CHECK","module=%s sha256=%s match=%d base=%p",name,hash,ok,module); return ok;
 }
-#define RBR_CONTROLS_IGNITION_SHA256 "ac6c1858c4a7abf22fa30df0d9e943c37b3e68caa7b1a86ce8c09547a78918dc"
-#define RBR_CONTROLS_IGNITION_RVA 0x2e4c0u
-#define RBR_CONTROLS_IGNITION_ACTION 6
-#define RBR_CONTROLS_IGNITION_HOLD_MS 650u
-typedef int (__stdcall *RbrControlsActionFn)(int action,int state);
-static RbrControlsActionFn rbr_controls_action;
-static int rbr_ignition_release_attempts;
-static void check_rbrcontrols_ignition_bridge(void) {
-    if(rbr_ignition_bridge_checked) return;
-    rbr_ignition_bridge_checked=1;
-    HMODULE module=GetModuleHandleW(L"RBRControls.dll");
-    if(!module) { log_event("RBR_CONTROLS_IGNITION_BRIDGE","available=0 reason=module_missing"); return; }
-    if(!hash_module(module,RBR_CONTROLS_IGNITION_SHA256,"RBRControls")) {
-        log_event("RBR_CONTROLS_IGNITION_BRIDGE","available=0 reason=hash_mismatch expected_sha256=%s",RBR_CONTROLS_IGNITION_SHA256); return;
-    }
-    uintptr_t address=(uintptr_t)module+RBR_CONTROLS_IGNITION_RVA;
-    MEMORY_BASIC_INFORMATION region; memset(&region,0,sizeof(region)); unsigned char signature[5];
-    const unsigned char expected[5]={0x83,0xec,0x14,0x83,0x3d};
-    DWORD protection=0;
-    if(VirtualQuery((const void*)address,&region,sizeof(region))) protection=region.Protect&0xffu;
-    if(!region.BaseAddress || region.State!=MEM_COMMIT ||
-       (protection!=PAGE_EXECUTE && protection!=PAGE_EXECUTE_READ && protection!=PAGE_EXECUTE_READWRITE && protection!=PAGE_EXECUTE_WRITECOPY) ||
-       !read_mem(address,signature,sizeof(signature)) || memcmp(signature,expected,sizeof(expected))) {
-        log_event("RBR_CONTROLS_IGNITION_BRIDGE","available=0 reason=code_signature_mismatch address=%08lx",(unsigned long)address); return;
-    }
-    rbr_controls_action=(RbrControlsActionFn)address;
-    rbr_ignition_bridge_available=1;
-    log_event("RBR_CONTROLS_IGNITION_BRIDGE","available=1 rva=%08lx action=%d call_convention=stdcall verified_sha256=1 signature=1 hold_ms=%lu",
-      (unsigned long)RBR_CONTROLS_IGNITION_RVA,RBR_CONTROLS_IGNITION_ACTION,(unsigned long)RBR_CONTROLS_IGNITION_HOLD_MS);
-}
-static int call_rbrcontrols_ignition(int state,const char *phase) {
-    check_rbrcontrols_ignition_bridge();
-    if(!rbr_ignition_bridge_available || !rbr_controls_action) return 0;
-    int route_result=rbr_controls_action(RBR_CONTROLS_IGNITION_ACTION,state);
-    log_event("RBR_CONTROLS_IGNITION_STATE","phase=%s action=%d state=%d route_result=%d rva=%08lx",
-      phase,RBR_CONTROLS_IGNITION_ACTION,state,route_result,(unsigned long)RBR_CONTROLS_IGNITION_RVA);
-    return route_result!=0;
-}
-static void begin_rbrcontrols_ignition_hold(void) {
-    if(rbr_ignition_hold_active) { log_event("RBR_CONTROLS_IGNITION_SKIP","reason=hold_already_active"); return; }
-    check_rbrcontrols_ignition_bridge();
-    if(!rbr_ignition_bridge_available) { log_event("RBR_CONTROLS_IGNITION_SKIP","reason=bridge_unavailable hash_gated=1"); return; }
-    if(call_rbrcontrols_ignition(1,"countdown_begin")) {
-        rbr_ignition_hold_active=1; rbr_ignition_release_at=GetTickCount()+RBR_CONTROLS_IGNITION_HOLD_MS; rbr_ignition_release_attempts=0;
-        log_event("RBR_CONTROLS_IGNITION_HOLD_BEGIN","hold_ms=%lu timing=countdown_frozen clutch_help_active=%d route_result=1",
-          (unsigned long)RBR_CONTROLS_IGNITION_HOLD_MS,clutch_help_temp_active);
-    } else log_event("RBR_CONTROLS_IGNITION_HOLD_FAILED","phase=countdown_begin reason=internal_route_returned_zero");
-}
-static void release_rbrcontrols_ignition(const char *reason) {
-    if(!rbr_ignition_hold_active) return;
-    if(call_rbrcontrols_ignition(0,reason)) {
-        rbr_ignition_hold_active=0; rbr_ignition_release_at=0; rbr_ignition_release_attempts=0;
-        log_event("RBR_CONTROLS_IGNITION_HOLD_END","reason=%s release_route_result=1",reason);
-    } else {
-        rbr_ignition_release_attempts++;
-        rbr_ignition_release_at=GetTickCount()+250u;
-        log_event("RBR_CONTROLS_IGNITION_RELEASE_RETRY","reason=%s internal_route_zero_attempt=%d retry_ms=250",reason,rbr_ignition_release_attempts);
-    }
-}
-static void service_rbrcontrols_ignition(DWORD now) {
-    if(rbr_ignition_hold_active && (LONG)(now-rbr_ignition_release_at)>=0) release_rbrcontrols_ignition("hold_elapsed");
-}static int guid_is_zero(const GUID *guid) {
+static int guid_is_zero(const GUID *guid) {
     static const GUID zero={0}; return guid_equal(guid,&zero);
 }
 static void profile_write_int(const wchar_t *section,const wchar_t *key,int value) {
@@ -1131,8 +1159,8 @@ static void config_read(void) {
 }
 static void begin_menu_binding(int target) {
     menu_binding_target=target; menu_binding_wait_release=1;
-    for(unsigned i=0;i<joy_device_count;i++) memset(joy_devices[i].button_edges,0,sizeof(joy_devices[i].button_edges));
-    log_event("BINDING_CAPTURE_BEGIN","action=%s wait_for_release=1 controller_input=deferred_until_next_frame",binding_action_name(target));
+    clear_controller_edges();
+    log_event("BINDING_CAPTURE_BEGIN","action=%s wait_for_release=1 controller_input=plugin_owned_poll_30hz",binding_action_name(target));
     notify("Release controls, then press a key or controller button");
 }
 static int keyboard_any_down(void) {
@@ -1226,19 +1254,37 @@ static void timer_disarm(const char *reason) {
     timer_run_count=0; timer_best_count=0; timer_finish_set=0; timer_reference_valid=0;
     timer_last_result_valid=0; timer_finish_world_valid=0; timer_result_display_active=0; timer_result_display_started_at=0;
 }
+static void clear_restart_and_finish_after_jump_back(void) {
+    int restart_was_saved=mark.valid;
+    int finish_was_saved=timer_finish_set || pending_first_finish_valid;
+    int timer_was_armed=timer_armed;
+    int pending_finish_was_saved=pending_first_finish_valid;
+    timer_disarm("jump_back_confirmed");
+    memset(&mark,0,sizeof(mark));
+    pending_first_finish_valid=0;
+    timer_start_line=0; timer_finish_line=0; timer_start_time=0; timer_last_record_time=0;
+    timer_best_total=0; timer_last_result_delta=0; timer_last_result_total=0; timer_display_value=0;
+    memset(timer_finish_world,0,sizeof(timer_finish_world));
+    finish_marker_reported=0; finish_marker_candidate=0; finish_marker_candidate_at=0;
+    timer_regression_reported=0; timer_overlay_reported=-1;
+    log_event("JUMP_BACK_SESSION_POINTS_CLEARED","restart_point_cleared=%d finish_point_cleared=%d timer_was_armed=%d pending_finish_cleared=%d timer_results_cleared=1 jump_back_checkpoints_preserved=1",restart_was_saved,finish_was_saved,timer_was_armed,pending_finish_was_saved);
+}
 static void timer_reset_for_new_session(const Sample *s) {
     DWORD now=GetTickCount();
-    timer_armed=0; timer_state=TIMER_OFF; timer_finish_set=0; timer_reference_valid=0; timer_previous_valid=0;
+    timer_armed=1; timer_state=TIMER_WAIT_START; timer_finish_set=0; timer_reference_valid=0;
     timer_start_line=s->distance+5.0f; timer_finish_line=0; timer_start_time=0; timer_last_record_time=0;
+    timer_previous_distance=s->distance; timer_previous_race_time=s->time; timer_previous_valid=1;
     timer_run_count=0; timer_best_count=0; timer_best_total=0; timer_last_result_delta=0;
     timer_last_result_total=0; timer_last_result_valid=0; timer_finish_world_valid=0; finish_marker_reported=0; finish_marker_candidate=0; finish_marker_candidate_at=now;
-    timer_display_mode=0; timer_display_value=0; timer_display_updated=now; position_saved_until=now+3000u; timer_overlay_reported=-1;
+    timer_display_mode=1; timer_display_value=0; timer_display_updated=now; position_saved_until=now+3000u; timer_overlay_reported=-1;
     timer_result_display_active=0; timer_result_display_started_at=0; timer_regression_reported=0;
     pending_first_finish_valid=0;
     log_event("SESSION_RESET","run=%u previous_results_cleared=1 finish_line_cleared=1",generation);
-    log_event("TIMER_WAIT_FINISH_POINT","saved_mark=%.5f timer_start_line=%.5f timer_armed=0",s->distance,timer_start_line);
-    notify("Position saved; press Space at the finish point");
+    log_event("TIMER_ARMED","source=first_enter saved_mark=%.5f timer_start_line=%.5f finish_set=0 timer_starts_on_crossing=1 sample_hz=30",s->distance,timer_start_line);
+    notify("Position saved; stopwatch starts at +5 m");
 }
+static int timer_record_sample(float distance,float race_time,const char *source,const char **failure_reason);
+static void timer_finish_trial(float elapsed);
 static int timer_queue_first_finish(const Sample *s) {
     if(!s || !mark.valid || !s->active || !same_context(s,&mark.sample)) {
         log_event("TIMER_FINISH_POINT_REJECTED","reason=invalid_or_different_context active=%d mark_valid=%d",s?s->active:0,mark.valid);
@@ -1248,26 +1294,46 @@ static int timer_queue_first_finish(const Sample *s) {
         log_event("TIMER_FINISH_POINT_REJECTED","reason=too_close_to_start start=%.5f minimum_finish=%.5f candidate=%.5f",timer_start_line,timer_start_line+1.0f,s->distance);
         notify("Drive past the +5 m start, then press Space at the finish"); return 0;
     }
+    if(!timer_armed || timer_state!=TIMER_RUNNING || !isfinite(timer_start_time)) {
+        log_event("TIMER_FINISH_POINT_REJECTED","reason=stopwatch_not_running state=%d armed=%d candidate=%.5f start=%.5f",timer_state,timer_armed,s->distance,timer_start_line);
+        notify("Wait for the stopwatch to start at +5 m"); return 0;
+    }
+    float elapsed=s->time-timer_start_time;
+    if(!isfinite(elapsed) || elapsed<=0 || !timer_run_count) {
+        log_event("TIMER_FINISH_POINT_REJECTED","reason=no_valid_first_pass elapsed=%.5f points=%u",elapsed,timer_run_count);
+        notify("No timed run recorded; continue past +5 m"); return 0;
+    }
+    float final_elapsed=s->time-timer_start_time;
+    TimerPoint last=timer_run[timer_run_count-1];
+    if(fabsf(last.distance-s->distance)>0.001f || fabsf(last.elapsed-final_elapsed)>0.001f) {
+        const char *sample_rejection=0;
+        if(!timer_record_sample(s->distance,s->time,"first_finish",&sample_rejection)) {
+            log_event("TIMER_FIRST_PASS_FINISH_REJECTED","reason=%s distance=%.5f elapsed=%.5f points=%u",sample_rejection?sample_rejection:"unknown",s->distance,final_elapsed,timer_run_count);
+            notify("Finish sample rejected; see log"); return 0;
+        }
+    }
+    timer_finish_line=s->distance; timer_finish_set=1;
     pending_first_finish_sample=*s; pending_first_finish_valid=1;
-    log_event("TIMER_FIRST_FINISH_PENDING","start=%.5f finish=%.5f segment=%.5f timer_armed=0 reset_pending=1",timer_start_line,s->distance,s->distance-timer_start_line);
-    notify("Finish marked; first Space return starts the timer");
+    timer_finish_trial(elapsed);
+    log_event("TIMER_FIRST_FINISH_PENDING","start=%.5f finish=%.5f segment=%.5f first_pass_recorded=1 reset_pending=1",timer_start_line,s->distance,s->distance-timer_start_line);
+    notify("Finish marked; first time recorded");
     return 1;
 }
 static int timer_arm_after_first_restart(void) {
     if(!pending_first_finish_valid || !mark.valid || !same_context_objects(&pending_first_finish_sample,&mark.sample)) return 0;
     DWORD now=GetTickCount();
-    timer_armed=1; timer_state=TIMER_WAIT_START; timer_finish_set=1; timer_reference_valid=0; timer_previous_valid=0;
+    timer_armed=1; timer_state=TIMER_WAIT_START; timer_finish_set=1; timer_previous_valid=0;
     timer_start_line=mark.sample.distance+5.0f; timer_finish_line=pending_first_finish_sample.distance;
-    timer_start_time=0; timer_last_record_time=0; timer_run_count=0; timer_best_count=0; timer_best_total=0;
-    timer_last_result_delta=0; timer_last_result_total=0; timer_last_result_valid=0; timer_regression_reported=0;
+    timer_start_time=0; timer_last_record_time=0; timer_run_count=0;
+    timer_regression_reported=0;
     timer_finish_world[0]=pending_first_finish_sample.x; timer_finish_world[1]=pending_first_finish_sample.y; timer_finish_world[2]=pending_first_finish_sample.z;
     timer_finish_world_valid=1; finish_marker_reported=0; finish_marker_candidate=0; finish_marker_candidate_at=now;
-    timer_display_mode=0; timer_display_value=0; timer_display_updated=now; timer_overlay_reported=-1; position_saved_until=0;
-    timer_result_display_active=0; timer_result_display_started_at=0;
+    timer_display_mode=timer_last_result_valid && timer_result_display_visible(now)?4:0;
+    timer_display_value=timer_last_result_total; timer_display_updated=now; timer_overlay_reported=-1; position_saved_until=0;
     log_event("TIMER_FINISH_SET","source=first_restart start=%.5f finish=%.5f segment=%.5f",timer_start_line,timer_finish_line,timer_finish_line-timer_start_line);
-    log_event("TIMER_ARMED","source=first_restart_confirmed start_line=%.5f finish_line=%.5f timer_starts_on_crossing=1 sample_hz=30",timer_start_line,timer_finish_line);
+    log_event("TIMER_ARMED","source=first_restart_confirmed start_line=%.5f finish_line=%.5f first_pass_reference_valid=%d timer_starts_on_crossing=1 sample_hz=30",timer_start_line,timer_finish_line,timer_reference_valid);
     pending_first_finish_valid=0;
-    notify("First reset confirmed; timer starts at +5 m");
+    notify("First reset confirmed; comparison starts at +5 m");
     return 1;
 }
 static void timer_prepare_trial(void) {
@@ -1421,11 +1487,15 @@ static void timer_step(const Sample *s,int valid,int suppressed) {
 }
 static void invalidate(const char *why) {
     timer_disarm(why);
-    release_rbrcontrols_ignition("invalidate");
     restore_clutch_help("invalidate");
     if(countdown_active) { log_event("FREEZE_ABORTED","reason=%s no_stale_write=1",why); countdown_active=0; }
     if(jump_back_pending) log_event("JUMP_BACK_ABORTED","reason=context_invalidated target=%.3f",jump_back_pending_distance);
-    jump_back_pending=0; jump_back_started_at=0; jump_back_last_success_at=0;
+    if(jump_back_queued) log_event("JUMP_BACK_QUEUE_CLEARED","reason=context_invalidated queued=%u",jump_back_queued);
+    jump_back_pending=0; jump_back_queued=0; jump_back_queue_head=0; jump_back_queue_ready=0;
+    jump_back_pending_press_at=0;
+    jump_back_started_at=0; jump_back_last_success_at=0;
+    jump_back_notice_steps=0; jump_back_notice_position=0;
+    jump_back_notice_last_success_press_at=0; jump_back_notice_until=0; jump_back_overlay_reported=0;
     jump_back_clear(&jump_back_state);
     pending_first_finish_valid=0;
     run_context_suspended=0; suspended_context_valid=0;
@@ -1639,7 +1709,6 @@ static void observe_load(const Sample *s,int valid,unsigned elapsed) {
                 gear_neutral_last_reported=neutral_ok?1:0;
                 log_event("GEAR_COUNTDOWN_GEAR_SET","phase=countdown_begin success=%d hold_raw_candidate=%d saved_gear_raw=%d actual_gear_raw=%d hold_during_countdown=1",neutral_ok,GEAR_HOLD_RAW_CANDIDATE,mark.sample.gear,neutral_actual);
             }
-            begin_rbrcontrols_ignition_hold();
         }
     }
 }
@@ -1663,7 +1732,6 @@ static void abort_return_countdown(const Sample *s,int valid,const char *reason)
         float actual[3]={0}; speed_attempted=1;
         speed_restored=write_velocity(s->movement,mark.sample.velocity,actual);
     }
-    release_rbrcontrols_ignition("countdown_abort");
     restore_clutch_help("countdown_abort");
     countdown_active=0; verifying=0; InterlockedExchange(&disabled,1);
     if(pending_fresh_session) log_event("FRESH_SESSION_CANCELLED","reason=return_countdown_aborted");
@@ -1672,7 +1740,6 @@ static void abort_return_countdown(const Sample *s,int valid,const char *reason)
     notify("Freeze interrupted; further calls disabled");
 }
 static void service_return_countdown(const Sample *s,int valid) {
-    service_rbrcontrols_ignition(GetTickCount());
     if(!countdown_active) {
         if(clutch_help_temp_active && (!clutch_help_restore_retry_at || (DWORD)(GetTickCount()-clutch_help_restore_retry_at)>=1000)) restore_clutch_help("deferred_retry");
         return;
@@ -1722,7 +1789,6 @@ static void service_return_countdown(const Sample *s,int valid) {
     if(restore_gear && seq_state!=0) return;
     speed_attempted=1; speed_restored=0;
     if(restore_speed) speed_restored=write_velocity(s->movement,mark.sample.velocity,actual);
-    release_rbrcontrols_ignition("countdown_release");
     restore_clutch_help("countdown_release");
     if(pending_fresh_session && valid) {
         Sample fresh; int fresh_valid=get_sample(&fresh); fresh.generation=generation;
@@ -1805,63 +1871,75 @@ static void observe_jump_back(const Sample *s,int valid) {
     if(valid && s->active && same_context(s,&jump_back_before)) {
         float error=fabsf(s->distance-jump_back_pending_distance);
         if(isfinite(error) && error<=2.0f) {
+            DWORD press_at=jump_back_pending_press_at;
             jump_back_commit(&jump_back_state,jump_back_pending_point);
-            jump_back_pending=0; jump_back_started_at=0; jump_back_last_success_at=now;
+            clear_restart_and_finish_after_jump_back();
+            jump_back_pending=0; jump_back_started_at=0; jump_back_pending_press_at=0; jump_back_last_success_at=now;
+            if(jump_back_notice_last_success_press_at && (DWORD)(press_at-jump_back_notice_last_success_press_at)<=JUMP_BACK_NOTICE_WINDOW_MS)
+                jump_back_notice_steps++;
+            else jump_back_notice_steps=1;
+            jump_back_notice_last_success_press_at=press_at; jump_back_notice_position=s->distance;
+            jump_back_notice_until=now+JUMP_BACK_NOTICE_DISPLAY_MS; jump_back_overlay_reported=0;
+            jump_back_queue_ready=jump_back_queued>0;
             log_event("JUMP_BACK_DONE","target=%.3f actual=%.3f error=%.3f index=%.3f elapsed_ms=%lu speed_before=%.3f speed_after=%.3f gear_before=%d gear_after=%d speed_write=0 gear_write=0",
                 jump_back_pending_distance,s->distance,error,jump_back_pending_index,(unsigned long)elapsed,jump_back_before.vector_speed,s->vector_speed,jump_back_before.gear,s->gear);
-            notify("Jump Back complete");
+            log_event("JUMP_BACK_DISPLAY_UPDATE","steps=%u nominal_distance_m=%u current_position_m=%.3f duration_ms=%u queued=%u",
+                jump_back_notice_steps,jump_back_notice_steps*(unsigned)JUMP_BACK_SPACING_METERS,jump_back_notice_position,
+                JUMP_BACK_NOTICE_DISPLAY_MS,jump_back_queued);
             return;
         }
     }
     if(elapsed>=1500u) {
         log_event("JUMP_BACK_FAILED","reason=target_not_observed elapsed_ms=%lu expected=%.3f sample_valid=%d actual=%.3f pending_state_preserved=0",
             (unsigned long)elapsed,jump_back_pending_distance,valid,valid?s->distance:NAN);
-        jump_back_pending=0; jump_back_started_at=0;
+        jump_back_pending=0; jump_back_started_at=0; jump_back_pending_press_at=0;
+        jump_back_queue_ready=jump_back_queued>0;
         notify("Jump Back target not confirmed; see log");
     }
 }
-static void do_jump_back(const Sample *s,int valid) {
-    if(jump_back_pending || verifying || countdown_active) {
-        log_event("JUMP_BACK_REJECTED","reason=reset_or_countdown_pending verifying=%d countdown=%d jump_pending=%d",verifying,countdown_active,jump_back_pending);
-        notify("Jump Back unavailable during reset"); return;
+static int start_jump_back(const Sample *s,int valid,DWORD press_at) {
+    if(verifying || countdown_active) {
+        log_event("JUMP_BACK_REJECTED","reason=reset_or_countdown_pending verifying=%d countdown=%d",verifying,countdown_active);
+        notify("Jump Back unavailable during reset"); return 0;
     }
-    if(!valid || !s->active || !s->foreground) {
+    if(!valid || !s || !s->active || !s->foreground) {
         log_event("JUMP_BACK_REJECTED","reason=invalid_or_inactive_sample valid=%d active=%d foreground=%d",valid,s?s->active:0,s?s->foreground:0);
-        notify("Jump Back requires an active stage"); return;
+        notify("Jump Back requires an active stage"); return 0;
     }
     if(disabled || !live_enabled || !executable_ok || !ngp_ok || !config_ok || GetCurrentThreadId()!=render_thread) {
         log_event("JUMP_BACK_REJECTED","reason=actions_unavailable disabled=%d live=%d exe=%d ngp=%d config=%d render_thread=%d",disabled,live_enabled,executable_ok,ngp_ok,config_ok,GetCurrentThreadId()==render_thread);
-        notify("Jump Back unavailable; see log"); return;
+        notify("Jump Back unavailable; see log"); return 0;
     }
     unsigned point_index=0;
     if(!jump_back_choose(&jump_back_state,s->distance,&point_index)) {
         log_event("JUMP_BACK_REJECTED","reason=no_checkpoint_behind current=%.3f points=%u last_jump_valid=%d",s->distance,jump_back_state.point_count,jump_back_state.last_jump_valid);
-        notify("No checkpoint behind the car"); return;
+        notify("No checkpoint behind the car"); return 0;
     }
     const JumpBackPoint *point=jump_back_get(&jump_back_state,point_index);
     float verified_index=0;
     if(!point || point->distance>=s->distance || !distance_index(distances,s->count,point->distance,&verified_index) || fabsf(verified_index-point->index)>.001f) {
         log_event("JUMP_BACK_REJECTED","reason=checkpoint_geometry_changed point=%u current=%.3f target=%.3f stored_index=%.3f",point_index,s->distance,point?point->distance:NAN,point?point->index:NAN);
-        notify("Jump Back route data changed"); return;
+        notify("Jump Back route data changed"); return 0;
     }
     if(!runtime_matches(1)) {
         log_event("JUMP_BACK_REJECTED","reason=unsupported_reset_route target=%.3f",point->distance);
-        notify("Jump Back reset route unsupported"); return;
+        notify("Jump Back reset route unsupported"); return 0;
     }
     uintptr_t manager=pointer_at(0x8d5338),notes=0;
     if(manager && manager<=UINTPTR_MAX-0x105b0) notes=pointer_at(manager+0x105b0);
     unsigned char old_block[16];
     if(!notes || !read_mem(s->movement+0x170,old_block,sizeof(old_block))) {
         log_event("JUMP_BACK_REJECTED","reason=reset_prerequisites_unavailable movement=%08lx notes=%08lx",(unsigned long)s->movement,(unsigned long)notes);
-        notify("Jump Back prerequisites unavailable"); return;
+        notify("Jump Back prerequisites unavailable"); return 0;
     }
     MEMORY_BASIC_INFORMATION region;
     if(!VirtualQuery((void*)(s->movement+0x170),&region,sizeof(region)) || region.State!=MEM_COMMIT ||
        !(region.Protect&(PAGE_READWRITE|PAGE_EXECUTE_READWRITE))) {
         log_event("JUMP_BACK_REJECTED","reason=reset_state_not_writable movement=%08lx",(unsigned long)s->movement);
-        notify("Jump Back state not writable"); return;
+        notify("Jump Back state not writable"); return 0;
     }
     jump_back_before=*s; jump_back_pending=1; jump_back_pending_point=point_index;
+    jump_back_pending_press_at=press_at;
     jump_back_pending_distance=point->distance; jump_back_pending_index=point->index; jump_back_started_at=GetTickCount();
     log_event("JUMP_BACK_BEGIN","current=%.3f target=%.3f index=%.3f point=%u points=%u run=%u speed_before=%.3f gear_before=%d speed_write=0 gear_write=0 countdown=0",
         s->distance,point->distance,point->index,point_index,jump_back_state.point_count,s->generation,s->vector_speed,s->gear);
@@ -1871,7 +1949,36 @@ static void do_jump_back(const Sample *s,int valid) {
     Sample immediate; int immediate_valid=get_sample(&immediate); immediate.generation=generation;
     snapshot_log("JUMP_BACK_IMMEDIATE",&immediate);
     observe_jump_back(&immediate,immediate_valid);
-    if(jump_back_pending) notify("Jump Back pending; checking target");
+    if(jump_back_pending) log_event("JUMP_BACK_VERIFYING","target=%.3f timeout_ms=1500 queued=%u",jump_back_pending_distance,jump_back_queued);
+    return 1;
+}
+static void do_jump_back(const Sample *s,int valid) {
+    DWORD press_at=GetTickCount();
+    if(verifying || countdown_active) { start_jump_back(s,valid,press_at); return; }
+    if(jump_back_pending) {
+        if(jump_back_queued>=JUMP_BACK_MAX_POINTS) {
+            log_event("JUMP_BACK_QUEUE_FULL","queued=%u pending_target=%.3f",jump_back_queued,jump_back_pending_distance);
+            notify("Jump Back queue full"); return;
+        }
+        unsigned tail=(jump_back_queue_head+jump_back_queued)%JUMP_BACK_MAX_POINTS;
+        jump_back_queued_press_at[tail]=press_at;
+        jump_back_queued++;
+        log_event("JUMP_BACK_QUEUED","queued=%u pending_target=%.3f current=%.3f",jump_back_queued,jump_back_pending_distance,valid?s->distance:NAN);
+        return;
+    }
+    start_jump_back(s,valid,press_at);
+}
+static void service_jump_back_queue(const Sample *s,int valid) {
+    if(!jump_back_queue_ready || !jump_back_queued || jump_back_pending) return;
+    if(verifying || countdown_active || !valid || !s->active || !s->foreground) return;
+    DWORD press_at=jump_back_queued_press_at[jump_back_queue_head];
+    jump_back_queue_head=(jump_back_queue_head+1)%JUMP_BACK_MAX_POINTS;
+    jump_back_queue_ready=0; jump_back_queued--;
+    log_event("JUMP_BACK_QUEUE_RUN","remaining=%u current=%.3f",jump_back_queued,s->distance);
+    if(!start_jump_back(s,valid,press_at) && jump_back_queued) {
+        log_event("JUMP_BACK_QUEUE_CLEARED","reason=next_attempt_rejected remaining=%u",jump_back_queued);
+        jump_back_queued=0; jump_back_queue_head=0; jump_back_queue_ready=0;
+    }
 }
 static void frame_tick(void) {
     DWORD now=GetTickCount();
@@ -1892,8 +1999,8 @@ static void frame_tick(void) {
     down[3]=vk_reload>0 && (GetAsyncKeyState(vk_reload)&0x8000)!=0;
     for(int i=0;i<4;i++) {
         int was_down=keys[i];
-        edge[i]=key_edge(down[i],&keys[i]);
         int controller_action=(i==0 && save_input_kind==BIND_CONTROLLER) || (i==1 && load_input_kind==BIND_CONTROLLER) || (i==2 && jump_back_input_kind==BIND_CONTROLLER);
+        edge[i]=key_edge(down[i],&keys[i]);
         if(!down[i] && was_down) log_event(controller_action?"CONTROLLER_ACTION_UP":"KEY_UP","action=%s vk=%d",i==0?"save":(i==1?"load":(i==2?"jump_back":"reload")),vk[i]);
         if(edge[i]) {
             if(controller_action)
@@ -1954,6 +2061,7 @@ static void frame_tick(void) {
     was_paused=paused && !changed;
     update_jump_back_points(&s,valid);
     observe_jump_back(&s,valid);
+    service_jump_back_queue(&s,valid);
     service_sequential_shift(&s,valid);
     if(valid && s.active && !runtime_reported) { runtime_matches(1); position_report(&s); runtime_reported=1; }
     if(!valid || !s.active || !s.foreground || fabsf(s.speed)>.1f || s.vector_speed>.1f) stopped_tracking=0;
@@ -1977,9 +2085,18 @@ static void frame_tick(void) {
             if(target_observed) log_damage_probe("load_after",0);
             snapshot_log("LOAD_AFTER",&s);
             const char *verify_event=!core_good?"LOAD_VERIFICATION_FAILED":(!gear_ok?"LOAD_VERIFIED_GEAR_MISMATCH":((!position_ok || !velocity_ok)?"LOAD_VERIFIED_POSITION_SPEED_MISMATCH":"LOAD_VERIFIED"));
-            log_event(verify_event,"target=%.5f observed=%d first_observed_ms=%u actual=%.5f delta=%.5f final_distance=%.5f saved_xyz=%.5f,%.5f,%.5f held_xyz=%.5f,%.5f,%.5f xyz_error=%.5f position_ok=%d speed_raw_before=%.5f velocity_norm_before=%.5f speed_raw_after=%.5f velocity_norm_after=%.5f restore_orientation=%d restore_position=%d pose_applied=%d rotation_error_deg=%.5f rotation_ok=%d restore_speed=%d velocity_applied=%d velocity_ok=%d restore_gear=%d gear_strategy=direct_field_write gear_field_applied=%d gear_field_ok=%d gear_ok=%d engagement_status=not_directly_observable saved_gear_raw=%d actual_gear_raw=%d actions_disabled=%d",mark.sample.distance,target_observed,first_observed_ms,target_observed?load_observed.distance:s.distance,(target_observed?load_observed.distance:s.distance)-mark.sample.distance,s.distance,mark.sample.x,mark.sample.y,mark.sample.z,pose_restored?freeze_last.x:s.x,pose_restored?freeze_last.y:s.y,pose_restored?freeze_last.z:s.z,pose_position_error,position_ok,load_before.speed,load_before.vector_speed,s.speed,s.vector_speed,restore_orientation,restore_position,pose_restored,rotation_error,rotation_ok,restore_speed,speed_restored,velocity_ok,restore_gear,gear_restored,gear_ok,gear_ok,mark.sample.gear,s.gear,core_good?0:1);
-            verifying=0; if(!core_good) { InterlockedExchange(&disabled,1); pending_first_finish_valid=0; }
-            if(!core_good) notify("Load context or orientation mismatch; further calls disabled");
+            LONG actions_disabled=InterlockedCompareExchange(&disabled,0,0);
+            log_event(verify_event,"target=%.5f observed=%d first_observed_ms=%u actual=%.5f delta=%.5f final_distance=%.5f saved_xyz=%.5f,%.5f,%.5f held_xyz=%.5f,%.5f,%.5f xyz_error=%.5f position_ok=%d speed_raw_before=%.5f velocity_norm_before=%.5f speed_raw_after=%.5f velocity_norm_after=%.5f restore_orientation=%d restore_position=%d pose_applied=%d rotation_error_deg=%.5f rotation_ok=%d restore_speed=%d velocity_applied=%d velocity_ok=%d restore_gear=%d gear_strategy=direct_field_write gear_field_applied=%d gear_field_ok=%d gear_ok=%d engagement_status=not_directly_observable saved_gear_raw=%d actual_gear_raw=%d actions_disabled=%d",mark.sample.distance,target_observed,first_observed_ms,target_observed?load_observed.distance:s.distance,(target_observed?load_observed.distance:s.distance)-mark.sample.distance,s.distance,mark.sample.x,mark.sample.y,mark.sample.z,pose_restored?freeze_last.x:s.x,pose_restored?freeze_last.y:s.y,pose_restored?freeze_last.z:s.z,pose_position_error,position_ok,load_before.speed,load_before.vector_speed,s.speed,s.vector_speed,restore_orientation,restore_position,pose_restored,rotation_error,rotation_ok,restore_speed,speed_restored,velocity_ok,restore_gear,gear_restored,gear_ok,gear_ok,mark.sample.gear,s.gear,actions_disabled);
+            verifying=0;
+            if(!core_good) {
+                /* A failed return invalidates this bookmark, not unrelated plugin actions. */
+                pending_first_finish_valid=0;
+                mark.valid=0;
+                timer_armed=0; timer_state=TIMER_OFF; timer_previous_valid=0; timer_run_count=0;
+                timer_finish_set=0; timer_finish_world_valid=0;
+                log_event("LOAD_FAILURE_LOCALIZED","actions_disabled=0 bookmark_cleared=1 timer_attempt_stopped=1 best_result_preserved=%d last_result_preserved=%d",timer_reference_valid,timer_last_result_valid);
+            }
+            if(!core_good) notify("Load failed; saved point cleared. Save a new point");
             else if(!position_ok || !velocity_ok) notify("Returned; position or speed differs; actions remain enabled");
             else if(!gear_ok) notify("Returned; gear restore mismatch, actions remain enabled");
             else notify("Returned; position, direction and speed checked");
@@ -2021,54 +2138,87 @@ static void frame_tick(void) {
     if(edge[2]) do_jump_back(&s,valid);
     previous_sample=s;
 }
-static HRESULT WINAPI end_scene(IDirect3DDevice9 *device) {
-    DWORD heartbeat_now=GetTickCount();
+static HRESULT WINAPI present(IDirect3DDevice9 *device,const RECT *source,const RECT *destination,HWND window,const RGNDATA *dirty) {
+    DWORD now=GetTickCount();
     render_heartbeat_frames++;
-    if(!render_heartbeat_at || (DWORD)(heartbeat_now-render_heartbeat_at)>=1000) {
-        log_event("RENDER_HEARTBEAT","end_scene_calls=%u plugin_menu_overlay=enabled gameplay_overlays=%d",render_heartbeat_frames,DIAGNOSTIC_DISABLE_GAMEPLAY_OVERLAYS?0:1);
-        render_heartbeat_frames=0; render_heartbeat_at=heartbeat_now;
-    }
     if(!shutdown_done && !InterlockedCompareExchange(&busy,1,0)) {
-        frame_tick();
-        DWORD now=GetTickCount();
+        if(!last_frame_tick || (DWORD)(now-last_frame_tick)>=FRAME_TICK_INTERVAL_MS) {
+            last_frame_tick=now;
+            frame_tick();
+        }
+        now=GetTickCount();
+        if(!render_thread) render_thread=GetCurrentThreadId();
+        if(!render_heartbeat_at || (DWORD)(now-render_heartbeat_at)>=1000) {
+            log_event("RENDER_HEARTBEAT","present_calls=%u logic_hz_limit=30 plugin_menu_overlay=enabled gameplay_overlays=%d",render_heartbeat_frames,DIAGNOSTIC_DISABLE_GAMEPLAY_OVERLAYS?0:1);
+            render_heartbeat_frames=0; render_heartbeat_at=now;
+        }
         int menu_visible=plugin_menu_draw_tick && (DWORD)(now-plugin_menu_draw_tick)<=250u;
         if(!menu_visible && game && (LONG)(message_until-now)>0) {
             typedef void (TC *WriteMessage)(Object*,const char*,float,float,float);
-            /* SDK documents 0.0 as "until next call"; short timed messages can
-             * expire before the game's message pass when sent from EndScene. */
             ((WriteMessage)game->v[1])(game,message,0.0f,20.0f,30.0f);
         }
+        int saved_message_visible=position_saved_until && (LONG)(position_saved_until-now)>0;
+        int overlay_active=menu_visible || countdown_active || timer_display_mode!=0 || jump_back_notice_until!=0 || saved_message_visible;
+        if(overlay_active) {
+            IDirect3DStateBlock9 *frame_state=0;
+            IDirect3DSurface9 *backbuffer=0;
+            D3DSURFACE_DESC backbuffer_desc; memset(&backbuffer_desc,0,sizeof(backbuffer_desc));
+            HRESULT scene=IDirect3DDevice9_CreateStateBlock(device,D3DSBT_ALL,&frame_state);
+            if(SUCCEEDED(scene) && frame_state) scene=IDirect3DStateBlock9_Capture(frame_state);
+            else if(SUCCEEDED(scene)) scene=E_FAIL;
+            if(SUCCEEDED(scene)) scene=IDirect3DDevice9_GetBackBuffer(device,0,0,D3DBACKBUFFER_TYPE_MONO,&backbuffer);
+            if(SUCCEEDED(scene) && backbuffer) scene=IDirect3DSurface9_GetDesc(backbuffer,&backbuffer_desc);
+            if(SUCCEEDED(scene)) scene=IDirect3DDevice9_BeginScene(device);
+            if(SUCCEEDED(scene)) {
+                D3DVIEWPORT9 full_viewport={0,0,backbuffer_desc.Width,backbuffer_desc.Height,0.0f,1.0f};
+                scene=IDirect3DDevice9_SetViewport(device,&full_viewport);
+                if(SUCCEEDED(scene)) {
 #if DIAGNOSTIC_DISABLE_GAMEPLAY_OVERLAYS
-        if(!render_diagnostic_reported) {
-            log_event("RENDER_DIAGNOSTIC","plugin_menu_overlay=enabled gameplay_overlays=disabled frame_tick=enabled previous_end_scene=called");
-            render_diagnostic_reported=1;
-        }
-        if(menu_visible) draw_plugin_menu_overlay(device);
+                    if(!render_diagnostic_reported) {
+                        log_event("RENDER_DIAGNOSTIC","plugin_menu_overlay=enabled gameplay_overlays=disabled render_hook=Present frame_tick_hz=30");
+                        render_diagnostic_reported=1;
+                    }
+                    if(menu_visible) draw_plugin_menu_overlay(device);
 #else
-        if(menu_visible) draw_plugin_menu_overlay(device);
-        else {
-            menu_overlay_reported=-1;
-            draw_countdown_overlay(device);
-            draw_timer_overlay(device);
-            /* The in-world FINISH marker is disabled; the timer summary remains on screen. */
-        }
+                    if(menu_visible) draw_plugin_menu_overlay(device);
+                    else {
+                        menu_overlay_reported=-1;
+                        draw_countdown_overlay(device);
+                        draw_timer_overlay(device);
+                        draw_jump_back_overlay(device);
+                        /* The in-world FINISH marker is disabled; the timer summary remains on screen. */
+                    }
 #endif
+                }
+                if(frame_state) IDirect3DStateBlock9_Apply(frame_state);
+                HRESULT end=IDirect3DDevice9_EndScene(device);
+                if((FAILED(scene) || FAILED(end)) && !render_scene_failure_reported) {
+                    log_event("OVERLAY_SCENE_FAILED","stage=draw_or_end_scene draw_hr=%08lx end_hr=%08lx viewport=%lux%lu",(unsigned long)scene,(unsigned long)end,(unsigned long)backbuffer_desc.Width,(unsigned long)backbuffer_desc.Height);
+                    render_scene_failure_reported=1;
+                }
+            } else if(!render_scene_failure_reported) {
+                log_event("OVERLAY_SCENE_FAILED","stage=prepare_or_begin_scene hr=%08lx",(unsigned long)scene);
+                render_scene_failure_reported=1;
+            }
+            if(backbuffer) IDirect3DSurface9_Release(backbuffer);
+            if(frame_state) IDirect3DStateBlock9_Release(frame_state);
+        }
         InterlockedExchange(&busy,0);
     }
-    return previous_end?previous_end(device):D3D_OK;
+    return previous_present?previous_present(device,source,destination,window,dirty):D3D_OK;
 }
 static void CALLBACK timer_tick(HWND w,UINT msg,UINT_PTR id,DWORD time) {
     (void)w;(void)msg;(void)id;(void)time;
     if(!executable_ok || disabled || shutdown_done || hook_slot) return;
     uintptr_t a=pointer_at(0x7ea990), b=pointer_at(a+0x28), device=pointer_at(b+0xf4), vt=pointer_at(device);
-    uintptr_t fn=pointer_at(vt+42*sizeof(void*));
+    uintptr_t fn=pointer_at(vt+D3D9_PRESENT_SLOT*sizeof(void*));
     if(!device || !vt || !fn) return;
     DWORD old,ignored;
-    void **slot=(void**)(vt+42*sizeof(void*));
+    void **slot=(void**)(vt+D3D9_PRESENT_SLOT*sizeof(void*));
     if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&old)) { log_event("HOOK_FAILED","winerror=%lu",GetLastError()); return; }
-    previous_end=(EndSceneFn)InterlockedExchangePointer(slot,(void*)end_scene); hook_slot=slot;
+    previous_present=(PresentFn)InterlockedExchangePointer(slot,(void*)present); hook_slot=slot;
     VirtualProtect(slot,sizeof(void*),old,&ignored);
-    log_event("HOOK_READY","device=%08lx slot=%p previous=%p",(unsigned long)device,slot,previous_end);
+    log_event("PRESENT_HOOK_READY","device=%08lx slot=%p previous=%p vtable_index=%u",(unsigned long)device,slot,previous_present,D3D9_PRESENT_SLOT);
 }
 static LONG WINAPI exception_trace(EXCEPTION_POINTERS *e) {
     uintptr_t address=(uintptr_t)e->ExceptionRecord->ExceptionAddress;
@@ -2079,12 +2229,11 @@ static LONG WINAPI exception_trace(EXCEPTION_POINTERS *e) {
 }
 static void shutdown_plugin(void) {
     if(shutdown_done) return; shutdown_done=1;
-    release_rbrcontrols_ignition("plugin_shutdown");
     restore_clutch_help("plugin_shutdown");
     if(seq_key_down) { int released=send_shift_key(vk_seq_up,1); log_event("SEQ_UP_KEYUP_SHUTDOWN","success=%d key=%d winerror=%lu",released,vk_seq_up,released?0:GetLastError()); seq_key_down=0; }
     if(timer_id) KillTimer(0,timer_id);
-    if(hook_slot && *hook_slot==(void*)end_scene) {
-        DWORD old,ignored; if(VirtualProtect(hook_slot,4,PAGE_READWRITE,&old)) { InterlockedCompareExchangePointer(hook_slot,(void*)previous_end,(void*)end_scene); VirtualProtect(hook_slot,4,old,&ignored); }
+    if(hook_slot && *hook_slot==(void*)present) {
+        DWORD old,ignored; if(VirtualProtect(hook_slot,4,PAGE_READWRITE,&old)) { InterlockedCompareExchangePointer(hook_slot,(void*)previous_present,(void*)present); VirtualProtect(hook_slot,4,old,&ignored); }
     }
     for(unsigned i=0;i<joy_device_count;i++) if(joy_devices[i].device) {
         IDirectInputDevice8_Unacquire(joy_devices[i].device);
@@ -2093,13 +2242,14 @@ static void shutdown_plugin(void) {
     if(direct_input) { IDirectInput8_Release(direct_input); direct_input=0; }
     if(dinput_module) { FreeLibrary(dinput_module); dinput_module=0; }
     log_event("SHUTDOWN","run=%u",generation);
+    if(log_file!=INVALID_HANDLE_VALUE) FlushFileBuffers(log_file);
     /* DLL is pinned for process lifetime, including in another plugin's hook chain. */
 }
 static void *TC destroy(Object *o,unsigned flags) { (void)flags; shutdown_plugin(); return o; }
 static const char *TC name(Object *o) { (void)o; return "LukyanukTraining"; }
 static void TC draw(Object *o) {
     (void)o;
-    /* EndScene paints the settings panel after the game's scenic menu pass. */
+    /* Present draws the settings panel after the complete game frame. */
     plugin_menu_draw_tick=GetTickCount();
 }
 static void TC draw_results(Object *o) { (void)o; }
@@ -2135,7 +2285,7 @@ __declspec(dllexport) Object *__cdecl RBR_CreatePlugin(Object *engine) {
     swprintf(file,1024,L"%ls\\session-%04u%02u%02u-%02u%02u%02u-%lu.log",logs,t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,GetCurrentProcessId());
     log_file=CreateFileW(file,GENERIC_WRITE,FILE_SHARE_READ,0,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,0);
     if(log_file==INVALID_HANDLE_VALUE) { InterlockedExchange(&disabled,1); snprintf(message,sizeof(message),"Logging unavailable; plugin disabled"); return &plugin; }
-    log_event("START","version=%s bits=%u backend=direct-RBR factory_thread=%lu position_tolerance_m=%.2f orientation_tolerance_deg=%.1f pose_z_feedback_tolerance_m=%.2f timer_target_sample_hz=30 engine_rpm_code=absent rbrcontrols_ignition_test=hash_gated_rva_2e4c0 action=6 hold_ms=%lu",VERSION,(unsigned)(sizeof(void*)*8),factory_thread,POSITION_TOLERANCE_METERS,ORIENTATION_TOLERANCE_DEGREES,POSE_Z_FEEDBACK_TOLERANCE_METERS,(unsigned long)RBR_CONTROLS_IGNITION_HOLD_MS);
+    log_event("START","version=%s bits=%u backend=direct-RBR render_hook=Present frame_tick_hz_limit=30 controller_input=plugin_owned_DirectInput8 poll_hz_limit=30 factory_thread=%lu position_tolerance_m=%.2f orientation_tolerance_deg=%.1f pose_z_feedback_tolerance_m=%.2f timer_target_sample_hz=30 engine_rpm_code=absent",VERSION,(unsigned)(sizeof(void*)*8),factory_thread,POSITION_TOLERANCE_METERS,ORIENTATION_TOLERANCE_DEGREES,POSE_Z_FEEDBACK_TOLERANCE_METERS);
     executable_ok=(uintptr_t)GetModuleHandleW(0)==0x400000 && hash_module(GetModuleHandleW(0),EXE_HASH,"RBR_EXE");
     if(!executable_ok) log_event("DISABLED","reason=unsupported_executable");
     config_read(); AddVectoredExceptionHandler(0,exception_trace);
