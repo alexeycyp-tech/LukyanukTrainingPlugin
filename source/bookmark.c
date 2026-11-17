@@ -86,6 +86,8 @@ static DWORD seq_release_at, seq_check_at;
 static int countdown_active, countdown_last=-1;
 static int overlay_reported_second=-1;
 static DWORD countdown_started_at, countdown_released_at;
+static DWORD countdown_pause_started_at, countdown_paused_total;
+static int countdown_is_paused;
 static int pending_fresh_session,pending_fresh_sample_valid;
 static Sample pending_fresh_sample;
 static Sample freeze_pose, freeze_last;
@@ -310,6 +312,15 @@ static void clear_controller_edges(void) {
 static int countdown_seconds_remaining(DWORD elapsed_ms) {
     DWORD duration=(DWORD)RESUME_DELAY_SECONDS*1000;
     return elapsed_ms>=duration?0:(int)((duration-elapsed_ms+999)/1000);
+}
+static DWORD countdown_elapsed_ms(DWORD now) {
+    DWORD wall_elapsed=(DWORD)(now-countdown_started_at);
+    return wall_elapsed>=countdown_paused_total?wall_elapsed-countdown_paused_total:0;
+}
+static void reset_countdown_pause_tracking(void) {
+    countdown_pause_started_at=0;
+    countdown_paused_total=0;
+    countdown_is_paused=0;
 }
 typedef struct { float x,y,z,rhw; DWORD color; } ScreenVertex;
 #define OVERLAY_MAX_RECTS 32768
@@ -1488,7 +1499,11 @@ static void timer_step(const Sample *s,int valid,int suppressed) {
 static void invalidate(const char *why) {
     timer_disarm(why);
     restore_clutch_help("invalidate");
-    if(countdown_active) { log_event("FREEZE_ABORTED","reason=%s no_stale_write=1",why); countdown_active=0; }
+    if(countdown_active) {
+        log_event("FREEZE_ABORTED","reason=%s no_stale_write=1",why);
+        countdown_active=0; countdown_last=-1; gear_neutral_active=0;
+        reset_countdown_pause_tracking();
+    }
     if(jump_back_pending) log_event("JUMP_BACK_ABORTED","reason=context_invalidated target=%.3f",jump_back_pending_distance);
     if(jump_back_queued) log_event("JUMP_BACK_QUEUE_CLEARED","reason=context_invalidated queued=%u",jump_back_queued);
     jump_back_pending=0; jump_back_queued=0; jump_back_queue_head=0; jump_back_queue_ready=0;
@@ -1696,6 +1711,7 @@ static void observe_load(const Sample *s,int valid,unsigned elapsed) {
             log_event("POSE_RESTORE_RETURNED","sample_valid=1 position_ok=%d position_error=%.5f actual_xyz=%.5f,%.5f,%.5f setter_z=%.5f velocity_norm=%.5f rotation_error_deg=%.5f",pose_position_ok,pose_position_error,after.x,after.y,after.z,freeze_pose_input_z,after.vector_speed,pose_rotation_error);
             speed_attempted=0; speed_restored=0;
             countdown_active=1; countdown_last=-1; countdown_started_at=GetTickCount(); countdown_released_at=0;
+            reset_countdown_pause_tracking();
             log_event("FREEZE_BEGIN","duration_ms=%d method=pose_reapply_native_zero_velocity target_xyz=%.5f,%.5f,%.5f setter_z=%.5f velocity_norm_after_pose=%.5f saved_velocity_xyz=%.5f,%.5f,%.5f",RESUME_DELAY_SECONDS*1000,freeze_pose.x,freeze_pose.y,freeze_pose.z,freeze_pose_input_z,after.vector_speed,mark.sample.velocity[0],mark.sample.velocity[1],mark.sample.velocity[2]);
             if(pending_first_finish_valid && !timer_arm_after_first_restart()) {
                 log_event("TIMER_FIRST_RESTART_ARM_FAILED","reason=finish_candidate_context_mismatch");
@@ -1733,16 +1749,40 @@ static void abort_return_countdown(const Sample *s,int valid,const char *reason)
         speed_restored=write_velocity(s->movement,mark.sample.velocity,actual);
     }
     restore_clutch_help("countdown_abort");
-    countdown_active=0; verifying=0; InterlockedExchange(&disabled,1);
+    countdown_active=0; countdown_last=-1; verifying=0; gear_neutral_active=0;
+    reset_countdown_pause_tracking();
     if(pending_fresh_session) log_event("FRESH_SESSION_CANCELLED","reason=return_countdown_aborted");
     pending_fresh_session=0; pending_fresh_sample_valid=0;
-    log_event("FREEZE_ABORT","reason=%s context_ok=%d speed_recovery=%d",reason,context_ok,speed_restored);
-    notify("Freeze interrupted; further calls disabled");
+    log_event("FREEZE_ABORT","reason=%s context_ok=%d speed_recovery=%d actions_disabled=0",reason,context_ok,speed_restored);
+    notify("Countdown interrupted; actions remain enabled");
 }
-static void service_return_countdown(const Sample *s,int valid) {
+static void service_return_countdown(const Sample *s,int valid,int paused) {
     if(!countdown_active) {
         if(clutch_help_temp_active && (!clutch_help_restore_retry_at || (DWORD)(GetTickCount()-clutch_help_restore_retry_at)>=1000)) restore_clutch_help("deferred_retry");
         return;
+    }
+    DWORD now=GetTickCount();
+    if(paused) {
+        if(!valid || !same_context(s,&mark.sample)) {
+            abort_return_countdown(s,valid,"pause_context_changed"); return;
+        }
+        if(!countdown_is_paused) {
+            DWORD elapsed=countdown_elapsed_ms(now);
+            DWORD duration=(DWORD)RESUME_DELAY_SECONDS*1000;
+            DWORD remaining=elapsed>=duration?0:duration-elapsed;
+            countdown_is_paused=1; countdown_pause_started_at=now;
+            log_event("FREEZE_PAUSED","elapsed_ms=%lu remaining_ms=%lu context_preserved=1 no_game_state_write=1",(unsigned long)elapsed,(unsigned long)remaining);
+        }
+        return;
+    }
+    if(countdown_is_paused) {
+        if(!valid || !s->active || !same_context(s,&mark.sample)) {
+            abort_return_countdown(s,valid,"pause_resume_context_changed"); return;
+        }
+        DWORD pause_duration=(DWORD)(now-countdown_pause_started_at);
+        countdown_paused_total+=pause_duration;
+        countdown_is_paused=0; countdown_pause_started_at=0;
+        log_event("FREEZE_RESUMED","paused_ms=%lu total_paused_ms=%lu elapsed_ms=%lu context_preserved=1",(unsigned long)pause_duration,(unsigned long)countdown_paused_total,(unsigned long)countdown_elapsed_ms(now));
     }
     if(!valid || !s->active || !same_context(s,&mark.sample)) {
         abort_return_countdown(s,valid,"run_context_changed"); return;
@@ -1759,7 +1799,7 @@ static void service_return_countdown(const Sample *s,int valid) {
     pose_rotation_error=rotation_error_degrees(held.q,freeze_pose.q);
     freeze_last=held;
     pose_position_ok=!restore_position || (isfinite(pose_position_error) && pose_position_error<=POSITION_TOLERANCE_METERS);
-    DWORD now=GetTickCount(),elapsed=(DWORD)(now-countdown_started_at);
+    DWORD elapsed=countdown_elapsed_ms(now);
     int seconds=countdown_seconds_remaining(elapsed);
     if(seconds>0) {
         if(gear_neutral_active && held.gear!=GEAR_HOLD_RAW_CANDIDATE) {
@@ -1797,6 +1837,7 @@ static void service_return_countdown(const Sample *s,int valid) {
         log_event("FRESH_SESSION_CAPTURED","source=return_release sample_valid=%d distance=%.5f race_time=%.5f speed_restored=%d",pending_fresh_sample_valid,fresh.distance,fresh.time,speed_restored);
     }
     countdown_active=0; countdown_released_at=now; gear_neutral_active=0;
+    reset_countdown_pause_tracking();
     if(timer_armed && timer_finish_set && timer_state==TIMER_WAIT_START) {
         timer_previous_distance=s->distance; timer_previous_race_time=s->time; timer_previous_valid=1;
         log_event("TIMER_RETURN_BASELINE","distance=%.5f race_time=%.5f start_line=%.5f distance_to_start=%.5f",s->distance,s->time,timer_start_line,timer_start_line-s->distance);
@@ -1829,7 +1870,7 @@ static void do_load(const Sample *s) {
     MEMORY_BASIC_INFORMATION region;
     if(!VirtualQuery((void*)(s->movement+0x170),&region,sizeof(region)) || !(region.Protect&(PAGE_READWRITE|PAGE_EXECUTE_READWRITE))) { notify("Reset state not writable"); return; }
     log_event("LIVE_LOAD_BEGIN","target=%.5f index=%.6f movement=%08lx notes=%08lx original_block=%08lx,%08lx,%08lx,%08lx speed_limit=none speed_raw_before=%.5f velocity_norm_before=%.5f saved_speed_raw=%.5f saved_velocity_norm=%.5f saved_velocity_xyz=%.5f,%.5f,%.5f saved_gear_raw=%d restore_speed=%d restore_gear=%d",mark.sample.distance,index,(unsigned long)s->movement,(unsigned long)notes,(unsigned long)((DWORD*)old_block)[0],(unsigned long)((DWORD*)old_block)[1],(unsigned long)((DWORD*)old_block)[2],(unsigned long)((DWORD*)old_block)[3],s->speed,s->vector_speed,mark.sample.speed,mark.sample.vector_speed,mark.sample.velocity[0],mark.sample.velocity[1],mark.sample.velocity[2],mark.sample.gear,restore_speed,restore_gear);
-    load_before=*s; target_observed=0; first_observed_ms=0; motion_bucket=0; pose_attempted=0; pose_restored=0; pose_position_ok=0; pose_position_error=NAN; pose_rotation_error=NAN; speed_attempted=0; speed_restored=0; gear_attempted=0; gear_restored=0; gear_neutral_active=0; gear_neutral_last_reported=-1; countdown_active=0; countdown_last=-1; countdown_released_at=0;
+    load_before=*s; target_observed=0; first_observed_ms=0; motion_bucket=0; pose_attempted=0; pose_restored=0; pose_position_ok=0; pose_position_error=NAN; pose_rotation_error=NAN; speed_attempted=0; speed_restored=0; gear_attempted=0; gear_restored=0; gear_neutral_active=0; gear_neutral_last_reported=-1; countdown_active=0; countdown_last=-1; countdown_released_at=0; reset_countdown_pause_tracking();
     timer_prepare_trial();
     verification_at=GetTickCount();
     InterlockedExchange(&inside_load,1);
@@ -2070,7 +2111,7 @@ static void frame_tick(void) {
     if(verifying) {
         unsigned elapsed=(unsigned)(now-verification_at);
         observe_load(&s,valid,elapsed);
-        service_return_countdown(&s,valid);
+        service_return_countdown(&s,valid,paused);
         if(elapsed/100>motion_bucket) { motion_bucket=elapsed/100; snapshot_log("LOAD_MOTION",&s); }
         DWORD verify_now=GetTickCount();
         int timed_out=!target_observed && elapsed>=500;
