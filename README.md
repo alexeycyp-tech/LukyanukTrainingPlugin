@@ -17,7 +17,9 @@ The build script uses Zig 0.13.0 and targets 32-bit Windows. From the repository
 .\source\build.ps1 -Zig "C:\path\to\zig.exe"
 ```
 
-Generated build files are written under `build`, `Plugins`, and `Symbols`; these folders are excluded from Git.
+The script writes `Plugins\LukyanukTrainingPlugin.dll` and copies the tracked settings template from `package\Plugins\LukyanukTrainingPlugin\LukyanukTrainingPlugin.ini` to `Plugins\LukyanukTrainingPlugin\LukyanukTrainingPlugin.ini`. It creates these output folders on a fresh clone. The template enables live reset (`LiveLoad=1`), uses Enter and Space by default, and leaves Jump Back unassigned. An existing output INI is preserved so local button assignments are not overwritten.
+
+Generated build files are written under `build`, `Plugins`, and `Symbols`; these folders are excluded from Git. The `package` folder contains the tracked INI template.
 
 ## Package
 
